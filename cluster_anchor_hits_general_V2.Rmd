@@ -1,0 +1,174 @@
+---
+title: "Clustering Anchor Hits"
+output: html_notebook
+---
+
+```{r}
+params = list(gene = 'PARP1', z_cutoff = 2, cor_cutoff = 0.2, string_cutoff = 400)
+library(here)
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+library(ggpubr)
+library(googledrive)
+library(ggpmisc)
+library(extrafont)
+loadfonts() # to get Arial
+source(here('R', 'gene_netwoRks.R'))
+depmap_cut = as.character(params$cor_cutoff*100)
+string_cut = as.character(params$string_cutoff)
+anchor_gene_data <- read_excel(here('external', 'filtered_genes', 
+                                   'Supplementary Data_Primary Brunello_v3-JD.xlsx'),
+                               sheet = params$gene)
+chip_file <- read_tsv(here('raw', 'Chip_File', 'CP0041_GRCh38_NCBI_strict_gene_20190215.chip'))
+gene_symbol_ids <- chip_file %>%
+  select(`Gene Symbol`, `Gene ID`) %>%
+  distinct()
+```
+
+# Create Networks
+
+```{r}
+if (params$gene == 'BCL2L1') {
+  anchor_gene_data <- anchor_gene_data %>%
+    rename(all = `everything avg z-score`)
+} else if (params$gene == 'MCL1') {
+  anchor_gene_data <- anchor_gene_data %>%
+    rename(all = `everything avg z-score`)
+}
+anchor_gene_id_data <- right_join(anchor_gene_data, gene_symbol_ids)
+current_gene_hits <- anchor_gene_id_data %>%
+  filter(abs(all) > params$z_cutoff)
+gene_annotations <- current_gene_hits %>%
+  select(`Gene Symbol`, `Gene ID`)
+depmap_net <- infer_depmap_cor_net(gene_annotations, 
+                                   cutoff = params$cor_cutoff)
+string_db_net <- get_stringdb_net(gene_annotations, 
+                                  cutoff = params$string_cutoff) 
+```
+
+```{r}
+depmap_net_meta <- depmap_net %>%
+  activate(nodes) %>%
+  inner_join(current_gene_hits, by = c('name' = 'Gene Symbol'))
+all_depmap <- plot_depmap_cor_net(depmap_net_meta, names = FALSE, node_weight = 'all',
+                    node_range = c(1,3), edge_range = c(0.2,1))
+ggsave(here('manuscript_figures',params$gene,
+            paste(params$gene, 'z', params$z_cutoff, 'r100', depmap_cut, 
+             'whole_network.pdf', sep = '_')),all_depmap, width = 5, height = 5)
+string_db_net_meta <- string_db_net %>%
+  activate(nodes) %>%
+  inner_join(current_gene_hits, by = c('name' = 'Gene Symbol')) %>%
+  activate(edges) %>%
+  mutate(weight = weight/1000)
+all_string <- plot_stringdb_net(string_db_net_meta, 'all', names = FALSE,
+                                node_range = c(1,3), edge_range = c(0.2,1)) 
+ggsave(here('manuscript_figures',params$gene,
+            paste(params$gene, 'z', params$z_cutoff, 'string', string_cut, 
+             'whole_network.pdf', sep = '_')),all_string, width = 5, height = 5)
+```
+
+# Network Topology
+```{r}
+resamples = 1000
+string_degree_dist <- plot_degree_dist(string_db_net, 'STRING', resamples, 
+                                       params$string_cutoff, params$gene)
+ggsave(here('manuscript_figures',params$gene, 
+            paste(params$gene, 'z', params$z_cutoff, 'string', params$string_cutoff,
+             'degree_distribution.pdf', sep = '_')),string_degree_dist, width = 8, height = 8, 
+       units = 'cm')
+depmap_degree_dist <- plot_degree_dist(depmap_net, 'co-essentiality', 
+                                       resamples, params$cor_cutoff, params$gene)
+ggsave(here('manuscript_figures',params$gene, 
+            paste(params$gene, 'z', params$z_cutoff, 'r100', depmap_cut,
+             'degree_distribution.pdf', sep = '_')),depmap_degree_dist, width = 8, height = 8, 
+       units = 'cm')
+```
+# Top 20 Genes
+
+```{r}
+depmap_edge_density <- get_ranked_edge_density(depmap_net, current_gene_hits)
+string_edge_density <- get_ranked_edge_density(string_db_net, current_gene_hits)
+joined_edge_density <- bind_rows(depmap_edge_density$density %>% mutate(source = 'co-essentiality'), 
+                                 string_edge_density$density %>% mutate(source = 'STRING'))
+joined_ranks <- full_join(depmap_edge_density$ranked_edges %>% 
+                            select(A, B, cor, rank.A, rank.B, max_rank) %>%
+                            mutate(depmap = TRUE), 
+                           string_edge_density$ranked_edges %>% 
+                            select(A,B, rank.A, rank.B, max_rank, combined_score) %>%
+                            mutate(string = TRUE)) %>%
+  mutate('Category' = ifelse(!is.na(string), 
+                             ifelse(!is.na(depmap), 'both', 'STRING'), 'Co-essentiality')) %>%
+  arrange(max_rank)
+
+reversed_ranks <- joined_ranks %>%
+  mutate(temp_A = B, temp_B = A, 
+         temp_rank.A = rank.B, temp_rank.B = rank.A, 
+         A = temp_A, B = temp_B, 
+         rank.A = temp_rank.A, rank.B = temp_rank.B) %>%
+  select(-temp_A, -temp_B, -temp_rank.A, -temp_rank.B)
+
+bidirectional_ranks <- bind_rows(joined_ranks, reversed_ranks) %>%
+  mutate(A = fct_reorder(A, rank.A), B = fct_reorder(B, rank.B))
+
+top_ranks <- bidirectional_ranks %>%
+  filter(max_rank < 21)
+
+top_20_p = ggplot(top_ranks) +
+  geom_tile(color = 'black') +
+  aes(x = A, y = B, fill = Category) +
+  theme_classic() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        text = element_text(size = 10, family = 'Arial'), 
+        legend.key.size = unit(0.3, 'cm'), 
+        legend.position = 'top') +
+  xlab('') +
+  ylab('') +
+  scale_fill_manual(values = c('#6a3d9a','#a6cee3', '#fb9a99')) 
+ggsave(here('manuscript_figures',params$gene,
+            paste(params$gene, 'z', params$z_cutoff, 'string', params$string_cutoff,
+                  'r100', depmap_cut,
+                  'top20_comparison.pdf', sep = '_')),top_20_p, 
+       width = 9, height = 9, units = 'cm')
+```
+
+# Clustering
+```{r}
+depmap_cluster_list <- get_clusters(depmap_net, current_gene_hits)
+string_cluster_list <- get_clusters(string_db_net %>%
+                                      activate(edges) %>%
+                                      mutate(weight = weight/1000), current_gene_hits)
+```
+
+## Cluster Barcodes
+
+```{r}
+depmap_barcodes <- plot_cluster_barcodes(depmap_cluster_list$clusters)
+ggsave(here('manuscript_figures', params$gene,
+            paste(params$gene, 'z', params$z_cutoff, 'r100', depmap_cut, 
+             'cluster_barcodes.pdf', sep = '_')),depmap_barcodes, width = 5, height = 5)
+string_barcodes <- plot_cluster_barcodes(string_cluster_list$clusters)
+ggsave(here('manuscript_figures', params$gene,
+            paste(params$gene, 'z', params$z_cutoff, 'string', params$string_cutoff, 
+             'cluster_barcodes.pdf', sep = '_')),string_barcodes, width = 5, height = 5)
+```
+
+
+# Plot clusters
+
+```{r}
+# Depmap only
+plot_clusters(depmap_cluster_list$clusters, params$gene, params$z_cutoff, depmap_cut, 'depmap')
+# String only
+plot_clusters(string_cluster_list$clusters, params$gene, params$z_cutoff, string_cut, 'string')
+```
+
+```{r}
+save.image(here('rdata',paste('gene', params$gene,'z', params$z_cutoff, 
+                              'cor', depmap_cut, 'string', params$string_cutoff, 
+                              '.RData',
+                              sep = '_')))
+```
+
+

@@ -1,0 +1,69 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(broom)
+library(here)
+```
+
+```{r}
+z_scores <- read_xlsx(here('external','filtered_genes','Supplementary Data_Primary Brunello_v3-JD.xlsx'), 
+                      sheet = 'PARP1') %>%
+  rename(`all abs max z-score` = `everything abs max z-score`)
+annotation_file <- here('external', 'filtered_genes','Supplementary Data_Gene Sets_v1.xlsx')
+sheets <- excel_sheets(annotation_file)
+```
+
+```{r}
+gathered_z_scores <- z_scores %>%
+  gather(score, value,-c(`Gene Symbol`, Type, n_guides))
+performances <- list()
+for (i in 1:length(sheets)) {
+  curr_sheet <- sheets[i]
+  annotations <- read_excel(annotation_file, sheet = curr_sheet)
+  ks_test <- gathered_z_scores %>%
+    group_by(score) %>%
+    nest() %>%
+    mutate(
+      ks = map(data, function(df) ks.test(
+        df$value[df$`Gene Symbol` %in% annotations$`Approved symbol`], 
+        df$value[!(df$`Gene Symbol` %in% annotations$`Approved symbol`)], 
+        alternative = 'greater', exact = FALSE)),
+      tidied = map(ks, tidy)
+    ) %>%
+    unnest(tidied, .drop = TRUE) %>%
+    mutate(list = curr_sheet)
+  performances[[curr_sheet]] <- ks_test
+}
+all_performances <- bind_rows(performances) %>%
+  mutate(score = fct_reorder(score, statistic), 
+         cell = fct_reorder(word(score), -statistic))
+```
+
+```{r}
+ks_fig <- ggplot(all_performances) +
+  aes(x = score, y = statistic, label = round(p.value, 2), 
+      fill = cell) +
+  geom_bar(stat = 'identity', color = 'black', width = 0.7) + 
+  facet_wrap('list') +
+  theme_classic() +
+  scale_fill_brewer(palette = 'Paired') +
+  theme(text = element_text(size = 16, color = 'black'), 
+        axis.text = element_text(size = 12, color = 'black')) +
+  coord_flip() +
+  ylab('KS statistic') +
+  xlab('')
+ggsave(here('figures', 'external_validation', 'PARP_lists_ks.pdf'), ks_fig,
+       width = 9, height = 6)
+```
+
+```{r}
+output_performances <- all_performances %>%
+  select(score, statistic, p.value, list, cell)
+write_csv(output_performances, here('tidy', 'pathways', 'PARP_lists_ks.csv'))
+```
+

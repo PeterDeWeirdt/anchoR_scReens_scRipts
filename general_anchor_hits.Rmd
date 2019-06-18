@@ -1,0 +1,557 @@
+---
+title: "Anchor Screen Hits"
+output: html_notebook
+---
+
+# Setup
+```{r}
+# Load necessary libraries
+library(tidyverse) #
+library(splines) #
+library(ggpubr)
+library(mgcv)
+library(BSDA)
+library(broom)
+library(ks)
+library(ggrepel)
+library(STRINGdb)
+library(pROC)
+library(writexl)
+library(here) #
+library(dplyr)
+
+lib = 'Brunello'
+
+if (lib == 'secondary') {
+  pdna = 'secondary_pDNA.csv'
+  chip = 'CP1255_GRCh38_NCBI_strict_gene_20190215.chip'
+  perturb_reference = 'Perturb_Reference.csv'
+  goldstandard = 'biogrid_string.csv'
+  screen = 'secondary_v3'
+  skip_header = 8
+  raw_lognorm_fs = list('secondary_Meljuso_parp_tp53_bcl2l1_mcl1.csv', 
+                        'secondary_OVCAR8_mcl1_bcl2l1_parp1_tp53.csv')
+  guides_per_gene = 10
+  min_guides = 7
+  max_guides = 11
+  outlier_assays = c()
+} else if (lib == 'Brunello') {
+  pdna = 'primary_pDNA.csv'
+  chip = 'CP0041_GRCh38_NCBI_strict_gene_20190215.chip'
+  perturb_reference = 'Perturb_Reference.csv'
+  goldstandard = 'biogrid_string.csv'
+  screen = 'Supplementary Data_Primary Brunello_v3'
+  skip_header = 8
+  raw_lognorm_fs = list('primary_A375_parp1.csv', 'primary_A375_VemR.csv',
+                     'primary_G402_TP53.csv', 'primary_HAP1_parp1.csv', 
+                     'primary_Meljuso_bcl2l1_mcl1.csv', 'primary_OVCAR8_mcl1_bcl2l1_parp1.csv')
+  guides_per_gene = 4
+  min_guides = 4
+  max_guides = 5
+  outlier_assays = c('HAP1_PARP1_sg1_Dropout_Negative_Primary', 
+                     'HAP1_6T_Talazoparib_Negative_Primary',
+                     'HAP1_PARP1_sg2_Dropout_Negative_Primary')
+  
+} else if (lib == 'Gattinara') {
+  pdna = 'gattinara_pDNA.csv'
+  chip = 'CP0073_GRCh38_NCBI_strict_gene_20190314.chip'
+  perturb_reference = 'Perturb_Reference.csv'
+  goldstandard = 'biogrid_string.csv'
+  screen = 'Gattinara_v3'
+  skip_header = 0
+  raw_lognorm_fs = list('primaryGattinara_A375_parp1_mcl1_bcl2l1.csv')
+  guides_per_gene = 2
+  min_guides = 2
+  max_guides = 3
+  outlier_assays = c()
+} else if (lib == 'A375_023_AACY04') {
+  pdna = 'secondary_A375_023_AACY04_pDNA.csv'
+  chip = 'CP1322_GRCh38_NCBI_strict_gene_20190314.chip'
+  perturb_reference = 'Perturb_Reference.csv'
+  goldstandard = 'biogrid_string.csv'
+  screen = 'A375_023_AACY04'
+  skip_header = 4
+  raw_lognorm_fs = list('secondary_A375_023_AACY04.csv')
+  guides_per_gene = 11
+  min_guides = 7
+  max_guides = 11
+} else if (lib == 'A375_212_AACY04') {
+  pdna = 'secondary_A375_212_AACY04_G0.csv'
+  chip = 'CP1322_GRCh38_NCBI_strict_gene_20190314.chip'
+  perturb_reference = 'Perturb_Reference.csv'
+  goldstandard = 'biogrid_string.csv'
+  screen = 'A375_212_AACY04'
+  skip_header = 4
+  raw_lognorm_fs = list('secondary_A375_212_AACY04.csv')
+  guides_per_gene = 11
+  min_guides = 7
+  max_guides = 11
+}
+  
+
+pdna_data = read_csv(here('raw', 'pDNA', pdna))
+chip_data = read_tsv(here('raw', 'Chip_File', chip)) %>% 
+  rename('Construct Barcode' = 'Barcode Sequence') 
+reference_data = read_csv(here('raw', 'Reference_Pairs', perturb_reference))
+gold_standard_data = read_csv(here('tidy', 'gs', goldstandard))
+```
+
+## Coallate data
+```{r}
+# Take raw lognorm data and coallate it
+raw_lognorm_l = list()
+for (file in raw_lognorm_fs) {
+  raw_lognorm_l[[file]] = read_csv(file.path('raw', 'LogNorm', file), 
+                                   skip = skip_header) %>% 
+    select(-'Construct IDs')
+}
+
+screen_data = raw_lognorm_l %>% reduce(inner_join, by = 'Construct Barcode')
+write_csv(screen_data, file.path('collated', 'guide_lognorm', 
+                                 paste(screen, 'lognorm_collated.csv', sep = '_')))
+```
+
+# QC
+## Replicate Correlation
+```{r}
+screen_melted = gather(screen_data, condition, LogNorm, -`Construct Barcode`)
+screen_pdna = inner_join(screen_melted, pdna_data, by = 'Construct Barcode', 
+                         suffix = c('','_pDNA'))
+screen_LFC = screen_pdna %>% 
+  mutate(LFC = LogNorm - LogNorm_pDNA) %>% 
+  select(-LogNorm, -LogNorm_pDNA)
+screen_rep_spread = screen_LFC %>% 
+  separate(condition, 
+           into = c('treatment', 'rep'),
+           sep = '\\_(?=(A\\Z|B\\Z))') %>%
+  mutate(short_treatment = gsub('NA_', '', treatment)) %>%
+  spread(rep, LFC) %>%
+  mutate(Avg.LFC = (A+B)/2)
+
+replicate_correlations = screen_rep_spread %>%
+  group_by(short_treatment) %>%
+  summarise(rep_cor = cor(A, B)) %>%
+  arrange(rep_cor)
+
+replicate_correlations
+```
+
+```{r}
+write_csv(replicate_correlations, here('tidy', 'screen', 'rep_cor', paste(screen, 'rep_cor.csv', 
+                                                  sep = '_')))
+```
+
+
+```{r}
+# Only run if you'd like to output plots of replicate correlation
+for (curr_treatment in unique(screen_rep_spread$short_treatment)) {
+  print(curr_treatment)
+  treatment_data = screen_rep_spread %>% 
+    filter(short_treatment == curr_treatment)
+  p = ggplot(treatment_data) +
+    aes(x = A, y = B) +
+    geom_point(alpha = 0.5) +
+    theme_classic() +
+    theme(aspect.ratio = 1, text = element_text(size = 12), 
+          plot.title = element_text(size = 12)) +
+    stat_cor(method = 'pearson') +
+    geom_abline() +
+    geom_density2d() +
+    ggtitle(paste(curr_treatment, 'LFC'))
+  ggsave(file.path('figures', 'rep_correlation', 
+                   paste(curr_treatment, 'rep_cor.png', sep = '_')),
+         width = 5, height = 5, units = 'in')
+}
+```
+
+```{r}
+write_csv(screen_rep_spread, file.path('tidy', 'guide', 
+                                 paste(screen, 'LFCs.csv', sep = '_')))
+```
+
+# Residuals
+## Guide Level
+```{r}
+reference_values = screen_rep_spread %>%
+  inner_join(reference_data, by = c('treatment' = 'Reference')) %>%
+  rename(reference = treatment, short_reference = short_treatment, treatment = Perturbed)
+```
+
+```{r}
+manuscript_freeze_lfcs <- screen_rep_spread %>%
+  filter(!grepl('MED12|NF2|NF1|Vem|TP53|G402_6T_NA_Dropout_Negative_Day14_Primary|G402_6T_NA_Dropout_Negative_Day21_Primary', treatment),
+          !(treatment %in% outlier_assays)) %>%
+  select(`Construct Barcode`, Avg.LFC, treatment)
+relevant_reference_data <- reference_data %>%
+  filter(Perturbed %in% manuscript_freeze_lfcs$treatment)
+manuscript_freeze_lfcs <- manuscript_freeze_lfcs %>%
+  spread(treatment, Avg.LFC)
+manuscript_freeze_excel <- list(LFC = manuscript_freeze_lfcs, mapping = chip_data,
+                                reference = relevant_reference_data)
+write_xlsx(manuscript_freeze_excel, here('data_freeze', paste(lib, 'lfcs.xlsx', sep = '_')))
+```
+
+
+```{r}
+x_y_data = inner_join(reference_values, screen_rep_spread, 
+                      by = c('treatment', 'Construct Barcode'), 
+                      suffix = c('.reference', ''))
+
+x_y_residuals = x_y_data %>%
+  group_by(treatment) %>%
+  mutate(residual = gam(Avg.LFC ~ ns(Avg.LFC.reference, df = 3))$residual)
+```
+
+```{r}
+# Get genes that have overlapping guides
+chip_guide_overlpas = chip_data %>%
+  group_by(`Construct Barcode`) %>%
+  summarise(overlap = paste(`Gene Symbol`, collapse = ' '))
+
+chip_gene_overlaps = chip_data %>%
+  inner_join(chip_guide_overlpas) %>%
+  group_by(`Gene Symbol`) %>%
+  summarise(overlap = paste(`overlap`, collapse = ' ')) %>% 
+  mutate(overlap = map_chr(str_split(overlap, ' '), function(x) {
+    unique_genes = unique(x)
+    return(paste(unique_genes, collapse = ', '))
+  }))
+```
+
+```{r}
+# Only run if you'd like to output plots of guide residuals
+for (curr_treatment in unique(x_y_residuals$short_treatment)) {
+  print(curr_treatment)
+  treatment_data = x_y_residuals %>% 
+    filter(short_treatment == curr_treatment)
+  p = ggplot(treatment_data) +
+    aes(x = Avg.LFC.reference, y = Avg.LFC, color = residual) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(method = 'gam', formula = y ~ ns(x, df = 3), color = 'black', size = 1) +
+    theme_classic() +
+    theme(aspect.ratio = 1, text = element_text(size = 12), 
+          plot.title = element_text(size = 12)) +
+    scale_color_gradient2(low = 'red', mid = 'white', high = 'blue') +
+    ggtitle(paste(curr_treatment, 'Guides'))
+  
+  ggsave(file.path('figures', 'residuals_guide', 
+                   paste(curr_treatment, 'guide_residuals.png', sep='_')),
+         width = 5, height = 5, units = 'in')
+}
+```
+
+
+
+
+```{r}
+guide_residuals = x_y_residuals %>%
+  left_join(chip_data) %>%
+  arrange(Avg.LFC.reference) %>% # Do this, so we can pick out distributional problems
+  mutate(`Gene Symbol` = ifelse(grepl('[A-z]', `Gene ID`),
+                               gsub('[0-9]','', `Gene Symbol`),
+                               `Gene Symbol`)) %>% # Group controls for even footing
+  group_by(`Gene Symbol`, treatment) %>%
+  mutate(target_number = ceiling(row_number()/guides_per_gene)) %>%
+  ungroup() %>%
+  mutate(`Gene Symbol` = ifelse(grepl('_$', `Gene Symbol`), 
+                                paste(`Gene Symbol`, target_number, sep = ''), 
+                                `Gene Symbol`)) 
+
+guide_out = paste(screen, 'guide_residuals.csv', sep = '_')
+write_csv(guide_residuals, file.path('tidy', 'guide', guide_out))
+```
+
+```{r}
+## Guide Residual plot for publication purposes
+# Get density of points in 2 dimensions.
+# @param x A numeric vector.
+# @param y A numeric vector.
+# @param n Create a square n by n grid to compute density.
+# @return The density within each square.
+get_density <- function(x, y, ...) {
+  dens <- MASS::kde2d(x, y, ...)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+
+bcl2l1_meljuso_guides <- guide_residuals %>%
+  filter(short_treatment == "Meljuso_BCL2L1_Dropout_Negative_Primary") %>%
+  mutate(density = get_density(Avg.LFC.reference, Avg.LFC, n = 200))
+
+p =ggplot(bcl2l1_meljuso_guides) +
+  aes(x = Avg.LFC.reference, y = Avg.LFC, color = density, label = `Gene Symbol`) +
+  geom_point() +
+  theme_classic() +
+  theme(aspect.ratio = 1) +
+  scale_color_viridis() +
+  geom_smooth(method = 'gam', formula = y ~ ns(x, df = 3), color = 'black', size = 1) 
+```
+
+## Gene Level
+
+```{r}
+population_stats = x_y_residuals %>%
+  group_by(treatment) %>%
+  summarise(pop_mean = mean(residual), 
+            pop_sd = sd(residual))
+
+gene_residuals = guide_residuals %>%
+  group_by(treatment) %>%
+  nest() %>%
+  inner_join(population_stats) %>%
+  mutate(gene_residuals = pmap(list(data, pop_mean, pop_sd), function(df, m, s) {
+           df %>%
+             group_by(`Gene Symbol`) %>%
+             summarise(Avg.Residual = mean(residual),
+                       Avg.LFC = mean(Avg.LFC),
+                       n_guides = length(residual),
+                       z = (Avg.Residual - m)/(s/sqrt(n_guides)), 
+                       p.value = 2*pnorm(-abs(z)), 
+                       nlog_p = -log10(p.value))
+         })) %>%
+  unnest(gene_residuals, .drop = TRUE)  %>%
+  mutate(short_treatment = gsub('NA_', '', treatment)) %>%
+  inner_join(reference_data, by = c('treatment' = 'Perturbed')) %>%
+  left_join(gold_standard_data, 
+            by = c('PerturbedGene' = 'query', 'Gene Symbol' = 'neighbor')) %>%
+  mutate(biogrid_interaction = replace_na(biogrid_interaction, FALSE), 
+         string_interaction = replace_na(string_interaction, FALSE)) %>%
+  inner_join(chip_gene_overlaps)
+```
+
+```{r}
+gene_residuals %>%
+  group_by(treatment) %>%
+  summarise(`*` = sum(p.value < 0.05),
+            `**` = sum(p.value < 0.01), 
+            `***` = sum(p.value < 0.001),
+            `****` = sum(p.value < 0.0001))
+```
+
+
+```{r}
+# Only run if you'd like ecdf plots
+for (curr_treatment in unique(gene_residuals$short_treatment)) {
+  print(curr_treatment)
+  treatment_data = gene_residuals %>% 
+    filter(short_treatment == curr_treatment)
+  
+  p = ggplot(treatment_data) +
+    aes(x = p.value, color = biogrid_interaction) +
+    scale_color_brewer(palette = 'Set1') +
+    stat_ecdf(size = 1) +
+    theme_classic() +
+    theme(aspect.ratio = 1, text = element_text(size = 12), 
+          plot.title = element_text(size = 12)) +
+    ggtitle(paste(curr_treatment, 'Genes')) +
+    ylab('cumulative fraction')
+  
+  ggsave(file.path('figures', 'ecdf', 
+                   paste(curr_treatment, 'ecdf.png', sep = '_')),
+         width = 5, height = 5, units = 'in')
+}
+```
+
+```{r}
+ks = gene_residuals %>%
+  group_by(treatment) %>%
+  nest() %>%
+  mutate(
+    biogrid_ks = map(data, function(df) {
+      ks.test(df$p.value[df$biogrid_interaction], df$p.value[!(df$biogrid_interaction)], 
+         alternative = 'greater')}),
+    string_ks = map(data, function(df) {
+      ks.test(df$p.value[df$string_interaction], df$p.value[!(df$string_interaction)], 
+         alternative = 'greater')}),
+    tidied_bio = map(biogrid_ks, function(model) tidy(model) %>% 
+                       rename_all(function(name) paste(name, 'biogrid'))), 
+    tidied_string = map(string_ks, function(model) tidy(model) %>% 
+                       rename_all(function(name) paste(name, 'string')))
+    ) %>%
+  unnest(tidied_bio, tidied_string, .drop = TRUE) %>%
+  mutate(string_rank = rank(`p.value string`),
+         biogrid_rank = rank(`p.value biogrid`),
+         mean_rank = (string_rank + biogrid_rank)/2) %>%
+  inner_join(reference_data, by = c('treatment' = 'Perturbed')) %>%
+  arrange(PerturbedGene, mean_rank)
+  
+```
+
+```{r}
+# Only run if you'd like ks plots
+melted_ks = ks %>%
+  mutate(short_treatment = gsub('NA_', '', treatment)) %>%
+  mutate(short_treatment = fct_reorder(short_treatment, mean_rank)) %>%
+  select(short_treatment, `p.value biogrid`, `p.value string`, PerturbedGene, Reference) %>%
+  gather(gs, p.value, `p.value biogrid`, `p.value string`) %>%
+  mutate(nlog_p = -log10(p.value))
+
+for (curr_gene in unique(ks$PerturbedGene)) {
+  print(curr_gene)
+  gene_data = melted_ks %>% 
+    filter(PerturbedGene == curr_gene)
+  
+  p = ggplot(gene_data) +
+    aes(x = short_treatment, y = nlog_p, fill = gs) +
+    geom_bar(stat = 'identity', position = 'dodge', color = 'black') +
+    scale_fill_brewer(palette = 'Set2') +
+    theme_classic() +
+    theme(text = element_text(size = 12), 
+          plot.title = element_text(size = 12), 
+          legend.position = 'right', 
+          axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.5)) +
+    ggtitle(paste(curr_gene, 'ks')) +
+    xlab('') 
+  
+  ggsave(file.path('figures', 'ks', 
+                   paste(curr_gene, '_', screen,'_ks.png', sep = '')),
+         width = 5, height = 5, units = 'in')
+}
+```
+
+```{r}
+write_csv(ks, file.path('tidy', 'pathways', paste(screen, 'ks.csv', sep = '_')))
+```
+
+```{r}
+# Only run if you'd like to output plots of gene residuals
+for (curr_treatment in unique(gene_residuals$short_treatment)) {
+  print(curr_treatment)
+  treatment_data = gene_residuals %>% 
+    filter(short_treatment == curr_treatment) %>%
+    mutate(control = grepl('_', `Gene Symbol`)) %>%
+    arrange(control)
+  p = ggplot(treatment_data) +
+    aes(x = Avg.Residual, y = nlog_p, label = `Gene Symbol`, 
+        color = control) +
+    scale_color_manual(values = c('black', 'grey')) +
+    geom_point() +
+    geom_rug() +
+    theme_classic() +
+    theme(aspect.ratio = 1, text = element_text(size = 12), 
+          plot.title = element_text(size = 12)) +
+    geom_label_repel(data = treatment_data %>% top_n(5, nlog_p), 
+                     label.padding = 0.1, size = 2.5,  
+                     color = 'blue') +
+    ggtitle(paste(curr_treatment, 'Genes'))
+  
+  ggsave(file.path('figures', 'residuals_gene', 
+                   paste(curr_treatment, 'gene_residuals.png', sep = '_')),
+         width = 5, height = 5, units = 'in')
+}
+```
+
+```{r}
+# Filter genes for (guides_per_gene + 1), PROTEIN_CODING or CONTROLS
+gene_annotations <- read_tsv(here('external', 'annotations', 
+                                 'ncbi_human_genes_20190424.tsv')) %>%
+  distinct() %>% # 51 genes are duplicated
+  mutate(Type = gene.type)
+  
+annotated_gene_residuals <- gene_residuals %>%
+  left_join(gene_annotations, by = c('Gene Symbol' = 'gene.symbol')) 
+
+gene_out = paste(screen, 'gene_residuals.csv', sep = '_')
+write_csv(annotated_gene_residuals, here('tidy', 'gene', gene_out))
+```
+
+# Unique to Brunello! 
+
+```{r}
+excelify_data <- function(tidy_data, type = 'freeze') {
+  # For sharing
+  gene_files = list()
+  for (curr_gene in unique(tidy_data$PerturbedGene)) {
+    print(curr_gene)
+    working_gene = tidy_data %>%
+      filter(PerturbedGene == curr_gene) %>%
+      separate(treatment, 
+               c('cell', 'ko', 'ko info', 'drug', 'type', 'day', 'screen'), 
+               sep = '_', remove = FALSE) %>%
+      mutate(perturbation = ifelse(drug != 'Dropout', 
+                                   ifelse(ko != '6T', drug,
+                                          paste(drug, ko, sep = '_')), 
+                                   ifelse(`ko info` == 'NA', 
+                                          ifelse(day == 'NA', ko, paste(ko, day, sep = '_')), 
+                                          ifelse(day == 'NA', 
+                                                 paste(ko, `ko info`, sep = '_'), 
+                                                 paste(ko, `ko info`, day, sep = '_')))),
+             drug_perturbation = drug != 'Dropout', 
+             genetic_perturabation = drug == 'Dropout', 
+             cell_perturbation = paste(cell, perturbation))
+    # Level 1: everything
+    all_averages = working_gene %>%
+      group_by(`Gene Symbol`, Type) %>%
+      summarise(`everything avg z-score` = mean(z), 
+                `everything abs max z-score` = z[which.max(abs(z))]) 
+    # Level 2: perturbation | cell
+    drug_averages = working_gene %>%
+      filter(drug_perturbation) %>%
+      group_by(`Gene Symbol`, Type) %>%
+      summarise(`drug avg z-score` = mean(z)) 
+    gp_average = working_gene %>%
+      filter(genetic_perturabation) %>%
+      group_by(`Gene Symbol`, Type) %>%
+      summarise(`genetic avg z-score` = mean(z))
+    cell_average = working_gene %>%
+      group_by(`Gene Symbol`, Type, cell) %>%
+      summarise(z = mean(z)) %>%
+      mutate(cell = paste(cell, 'avg z-score')) %>%
+      spread(cell, z)
+    # Level 4: invididual screen
+    gene_zscores = working_gene %>%
+      select(`Gene Symbol`, Type, n_guides, cell_perturbation, z) %>%
+      mutate(cell_perturbation = paste(cell_perturbation, 'z-score')) %>%
+      spread(cell_perturbation, z)
+    if (type == 'freeze') {
+      all_scores = list(gene_zscores, drug_averages, gp_average, cell_average,
+                        all_averages) %>%
+        reduce(full_join) 
+        gene_files[[curr_gene]] = all_scores
+
+    } else {
+      all_scores = list(gene_zscores, all_averages) %>%
+        reduce(full_join) 
+        gene_files[[curr_gene]] = all_scores
+    }
+  }
+  return(gene_files)
+}
+```
+
+
+```{r}
+# Create a spreadsheet of all of our data
+unfiltered_list = excelify_data(annotated_gene_residuals, type = 'interim')
+write_xlsx(unfiltered_list, path = file.path('collated','spread_gene',paste(screen,'unfiltered.xlsx', 
+                                                                       sep = '_')))
+```
+
+```{r}
+# Only revelevant for BRUNELLO data freeze
+filtered_gene_residuals <- annotated_gene_residuals %>%
+  filter((gene.type == 'PROTEIN_CODING') | 
+           (grepl('NO_SITE', `Gene Symbol`)), 
+         n_guides >= min_guides, 
+         n_guides <= max_guides, 
+         !(short_treatment %in% outlier_assays), 
+         PerturbedGene %in% c('MCL1', 'BCL2L1', 'PARP1')) %>%
+  mutate(Type = replace_na(Type, 'CONTROL'))
+
+filtered_gene_residuals %>%
+  select('Gene Symbol', Type) %>%
+  distinct() %>%
+  group_by(Type) %>%
+  summarise(n())
+
+gene_files = excelify_data(filtered_gene_residuals, type = 'freeze')
+
+write_xlsx(gene_files, path = file.path('collated','spread_gene',paste(screen,'.xlsx', 
+                                                                       sep = '')))
+```
+
+
+
+
